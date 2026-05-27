@@ -10,6 +10,24 @@ This tool can decrypt a meaningful subset of files for free, **without the attac
 
 ## TL;DR — recover your files
 
+# Docker Deployment (More Stable)
+
+```bash
+# 1. Get the tool
+git clone https://github.com/Saddytech/lockbit-rescue.git
+cd lockbit-rescue/_stream-reuse
+
+# 2. Build Docker
+docker build -t lockbit-rescue .
+
+# 3. Run it
+docker run --rm \
+  -v "/absolute/path/to/your/encrypted_data:/data_encrypted" \
+  -v "/absolute/path/to/your/output_data:/data_recovered" \
+  lockbit-rescue /data_encrypted /data_recovered
+```
+
+# Manual Installation
 ```bash
 # 1. Get the tool
 git clone https://github.com/Saddytech/lockbit-rescue.git
