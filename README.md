@@ -110,14 +110,16 @@ python3 lockbit-rescue.py SOURCE_DIR OUTPUT_DIR
 OUTPUT_DIR/
 ├── group_a1b2c3d4e5f6/         # one folder per encryption batch
 │   ├── photo1.jpg
-│   ├── docs/report.pdf         # original sub-paths flattened — see note
+│   ├── report.pdf              # original sub-paths flattened — see note
+│   ├── report__9f2a1c44.pdf    # duplicate basename disambiguated by source path
 │   └── ...
 ├── group_f0e9d8c7b6a5/
 │   └── ...
+├── manifest.csv                # source -> output mapping and per-file status
 └── .scratch/                   # temporary working files (safe to delete after)
 ```
 
-> **Note**: filenames inside `group_*/` keep their original *basename*, not their original full path. If you need to map a recovered file back to the original directory tree, cross-reference by basename with your encrypted source. A future version may emit a `manifest.csv`.
+> **Note**: filenames inside `group_*/` keep their original *basename*, not their original full path. When multiple source files in the same group share a basename, the tool appends a stable hash suffix so one recovered file cannot hide another. Use `manifest.csv` to map every source path to its recovered output and status.
 
 ### Verifying results
 
