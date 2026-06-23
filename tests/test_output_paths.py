@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 fake_tqdm = types.ModuleType("tqdm")
 fake_tqdm.tqdm = lambda iterable=None, *args, **kwargs: iterable if iterable is not None else []
-sys.modules.setdefault("tqdm", fake_tqdm)
+sys.modules["tqdm"] = fake_tqdm
 spec = importlib.util.spec_from_file_location("lockbit_rescue", ROOT / "lockbit-rescue.py")
 lockbit_rescue = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lockbit_rescue)
@@ -60,6 +60,11 @@ def test_manifest_has_one_header_and_expected_rows():
     assert [row["status"] for row in rows] == ["recovered", "suspect"]
 
 
+def test_source_relpath_falls_back_to_full_path_for_outside_paths():
+    assert lockbit_rescue.source_relpath(Path("/source"), "/outside/report.pdf") == "/outside/report.pdf"
+
+
 if __name__ == "__main__":
     test_duplicate_basenames_get_stable_unique_output_paths()
     test_manifest_has_one_header_and_expected_rows()
+    test_source_relpath_falls_back_to_full_path_for_outside_paths()

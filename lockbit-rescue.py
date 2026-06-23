@@ -164,7 +164,8 @@ def copy_with_progress(src: Path, dst: Path, label: str, position: int = 2):
 
 
 def copy_atomic_with_progress(src: Path, dst: Path, label: str, position: int = 2):
-    tmp = dst.with_name(f".{dst.name}.tmp")
+    tmp_id = hashlib.sha1(str(dst).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    tmp = dst.with_name(f".tmp-{tmp_id}")
     try:
         copy_with_progress(src, tmp, label, position)
         os.replace(tmp, dst)
@@ -190,11 +191,11 @@ def kek_fingerprint(kek_blob: bytes) -> str:
 
 
 def source_relpath(source: Path, path: str) -> str:
-    p = Path(path).resolve()
+    p = Path(path)
     try:
         return str(p.relative_to(source))
     except ValueError:
-        return p.name
+        return str(p)
 
 
 def collision_safe_name(original_name: str, rel_path: str, collides: bool) -> str:
@@ -445,15 +446,20 @@ def main():
             copy_with_progress(Path(oracle_path), local_oracle, f"  copy oracle {fmt_size(oracle_sz)}")
         except Exception as e:
             print(f"   [!] oracle copy failed: {e}")
+            pending = 0
             for fei_len, tfname, tpath, tsz in targets:
                 torig = tfname[: -len(args.ext)]
+                out_path = output_paths[(kek, tpath)]
+                status = "skipped_existing" if out_path.exists() else "oracle_copy_failed"
+                if status != "skipped_existing":
+                    pending += 1
                 append_manifest(manifest, {
                     "kek": kek, "source_path": tpath,
-                    "output_path": output_paths[(kek, tpath)],
+                    "output_path": out_path,
                     "original_name": torig, "fei_len": fei_len, "size": tsz,
-                    "status": "oracle_copy_failed",
+                    "status": status,
                 })
-            overall.update(len(targets))
+            overall.update(pending)
             continue
 
         grp_ok = grp_fail = 0
@@ -474,7 +480,6 @@ def main():
                     "original_name": torig, "fei_len": fei_len, "size": tsz,
                     "status": "skipped_existing",
                 })
-                overall.update(1)
                 continue
 
             local_target = scratch / f"_target{args.ext}"
