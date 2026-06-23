@@ -17,7 +17,9 @@ It will:
   5) Decrypt all other files in the group whose footer-encryption-info
      length fits within the recovered keystream
   6) Save recovered files to OUTPUT_DIR/group_<kek>/<original_name>
-  7) Verify each output with libmagic and skip writes for raw "data" results
+     (suffixing duplicate basenames so outputs do not collide)
+  7) Write manifest.csv with source/output/status mapping
+  8) Verify each output with libmagic and skip writes for raw "data" results
 
 Requires:
   - The `stream-reuse` binary (built from yohanes/lockbit-v3-linux-decryptor)
@@ -39,6 +41,7 @@ Usage examples:
 
 import argparse
 import collections
+import csv
 import hashlib
 import os
 import shutil
@@ -93,6 +96,10 @@ KEK_LEN = 128
 # Coverage formula derived empirically: see TECHNICAL.md.
 COVERAGE_OFFSET = 18
 COVERAGE_BASE_FROM_FEI = 82  # bytes consumed by fixed metadata
+MANIFEST_COLUMNS = [
+    "kek", "source_path", "output_path", "original_name",
+    "fei_len", "size", "status", "magic",
+]
 
 
 def detect_extension(source: Path, sample_limit: int = 5000) -> str:
@@ -156,6 +163,19 @@ def copy_with_progress(src: Path, dst: Path, label: str, position: int = 2):
         bar.close()
 
 
+def copy_atomic_with_progress(src: Path, dst: Path, label: str, position: int = 2):
+    tmp_id = hashlib.sha1(str(dst).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    tmp = dst.with_name(f".tmp-{tmp_id}")
+    try:
+        copy_with_progress(src, tmp, label, position)
+        os.replace(tmp, dst)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def read_footer(path: Path):
     """Return (fei_len, kek_blob) from the last 134 bytes of an encrypted file."""
     with open(path, "rb") as f:
@@ -168,6 +188,51 @@ def read_footer(path: Path):
 
 def kek_fingerprint(kek_blob: bytes) -> str:
     return hashlib.md5(kek_blob).hexdigest()[:12]
+
+
+def source_relpath(source: Path, path: str) -> str:
+    p = Path(path)
+    try:
+        return str(p.relative_to(source))
+    except ValueError:
+        return str(p)
+
+
+def collision_safe_name(original_name: str, rel_path: str, collides: bool) -> str:
+    if not collides:
+        return original_name
+    suffix = hashlib.sha1(rel_path.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+    p = Path(original_name)
+    if p.suffix:
+        return f"{p.stem}__{suffix}{p.suffix}"
+    return f"{original_name}__{suffix}"
+
+
+def build_output_paths(plans, source: Path, output: Path, ransom_ext: str):
+    """Return {(kek, encrypted_path): output_path}, suffixing duplicate basenames."""
+    output_paths = {}
+    collisions = 0
+    for _, kek, _, targets in plans:
+        name_keys = {tfname: tfname[: -len(ransom_ext)].casefold() for _, tfname, _, _ in targets}
+        base_counts = collections.Counter(name_keys[tfname] for _, tfname, _, _ in targets)
+        collisions += sum(c for c in base_counts.values() if c > 1)
+        group_out = output / f"group_{kek}"
+        for _, tfname, tpath, _ in targets:
+            original = tfname[: -len(ransom_ext)]
+            rel_path = source_relpath(source, tpath)
+            out_name = collision_safe_name(original, rel_path, base_counts[name_keys[tfname]] > 1)
+            output_paths[(kek, tpath)] = group_out / out_name
+    return output_paths, collisions
+
+
+def append_manifest(manifest: Path, row: dict):
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    needs_header = not manifest.exists() or manifest.stat().st_size == 0
+    with open(manifest, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
+        if needs_header:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in MANIFEST_COLUMNS})
 
 
 def scan(source: Path, ransom_ext: str, common_exts, no_extension_filter: bool,
@@ -333,10 +398,15 @@ def main():
     plans = build_plan(groups, args.ext)
     total_targets = sum(p[0] for p in plans)
     no_oracle = len(groups) - len(plans)
+    output_paths, collision_targets = build_output_paths(plans, source, output, args.ext)
+    manifest = output / "manifest.csv"
     print(f"[+] Plan: {len(plans)} decryptable groups / {len(groups)} total")
     print(f"    ({no_oracle} groups skipped — no oracle file with long enough filename)")
     print(f"    targets to attempt: {total_targets}")
+    if collision_targets:
+        print(f"    basename collisions protected: {collision_targets} target(s)")
     print(f"    output: {output}")
+    print(f"    manifest: {manifest}")
     if total_targets == 0:
         print("[!] Nothing to decrypt. Probably no group has a long-named oracle.")
         return
@@ -344,11 +414,9 @@ def main():
     # --- Resume bookkeeping ---
     already = 0
     for _, kek, _, targets in plans:
-        gdir = output / f"group_{kek}"
-        if gdir.is_dir():
-            for _, tfname, _, _ in targets:
-                if (gdir / tfname[: -len(args.ext)]).exists():
-                    already += 1
+        for _, _, tpath, _ in targets:
+            if output_paths[(kek, tpath)].exists():
+                already += 1
     if already:
         print(f"[i] Resume: {already} files already in output, will skip")
 
@@ -364,7 +432,7 @@ def main():
         group_out.mkdir(parents=True, exist_ok=True)
 
         # Skip group if fully done
-        existing = sum(1 for _, tf, _, _ in targets if (group_out / tf[:-len(args.ext)]).exists())
+        existing = sum(1 for _, _, tp, _ in targets if output_paths[(kek, tp)].exists())
         if existing == len(targets):
             print(f"[GROUP {gi+1}/{len(plans)}] {kek} already complete, skip")
             continue
@@ -378,7 +446,20 @@ def main():
             copy_with_progress(Path(oracle_path), local_oracle, f"  copy oracle {fmt_size(oracle_sz)}")
         except Exception as e:
             print(f"   [!] oracle copy failed: {e}")
-            overall.update(len(targets))
+            pending = 0
+            for fei_len, tfname, tpath, tsz in targets:
+                torig = tfname[: -len(args.ext)]
+                out_path = output_paths[(kek, tpath)]
+                status = "skipped_existing" if out_path.exists() else "oracle_copy_failed"
+                if status != "skipped_existing":
+                    pending += 1
+                append_manifest(manifest, {
+                    "kek": kek, "source_path": tpath,
+                    "output_path": out_path,
+                    "original_name": torig, "fei_len": fei_len, "size": tsz,
+                    "status": status,
+                })
+            overall.update(pending)
             continue
 
         grp_ok = grp_fail = 0
@@ -387,14 +468,18 @@ def main():
         t_start = time.time()
         for (fei_len, tfname, tpath, tsz) in grp_bar:
             torig = tfname[: -len(args.ext)]
-            out_path = group_out / torig
+            out_path = output_paths[(kek, tpath)]
             short = (torig[:35] + "...") if len(torig) > 35 else torig
             grp_bar.set_postfix({"cur": short, "sz": fmt_size(tsz),
                                  "ok": grp_ok, "fail": grp_fail})
 
             if out_path.exists():
                 grp_ok += 1
-                overall.update(1)
+                append_manifest(manifest, {
+                    "kek": kek, "source_path": tpath, "output_path": out_path,
+                    "original_name": torig, "fei_len": fei_len, "size": tsz,
+                    "status": "skipped_existing",
+                })
                 continue
 
             local_target = scratch / f"_target{args.ext}"
@@ -402,6 +487,11 @@ def main():
                 copy_with_progress(Path(tpath), local_target, f"    fetch {short}")
             except Exception:
                 grp_fail += 1
+                append_manifest(manifest, {
+                    "kek": kek, "source_path": tpath, "output_path": out_path,
+                    "original_name": torig, "fei_len": fei_len, "size": tsz,
+                    "status": "copy_failed",
+                })
                 overall.update(1)
                 continue
 
@@ -409,19 +499,39 @@ def main():
                                        oracle_orig, scratch, args.timeout)
             if decrypted is None:
                 grp_fail += 1
+                append_manifest(manifest, {
+                    "kek": kek, "source_path": tpath, "output_path": out_path,
+                    "original_name": torig, "fei_len": fei_len, "size": tsz,
+                    "status": "decrypt_failed",
+                })
             else:
                 ftype = libmagic(decrypted)
                 if is_bad_decrypt(ftype):
                     grp_fail += 1
+                    append_manifest(manifest, {
+                        "kek": kek, "source_path": tpath, "output_path": out_path,
+                        "original_name": torig, "fei_len": fei_len, "size": tsz,
+                        "status": "suspect", "magic": ftype,
+                    })
                     try: decrypted.unlink()
                     except: pass
                 else:
                     try:
-                        copy_with_progress(decrypted, out_path, f"    save {short}")
+                        copy_atomic_with_progress(decrypted, out_path, f"    save {short}")
                         decrypted.unlink()
                         grp_ok += 1
+                        append_manifest(manifest, {
+                            "kek": kek, "source_path": tpath, "output_path": out_path,
+                            "original_name": torig, "fei_len": fei_len, "size": tsz,
+                            "status": "recovered", "magic": ftype,
+                        })
                     except Exception:
                         grp_fail += 1
+                        append_manifest(manifest, {
+                            "kek": kek, "source_path": tpath, "output_path": out_path,
+                            "original_name": torig, "fei_len": fei_len, "size": tsz,
+                            "status": "save_failed", "magic": ftype,
+                        })
                         try: decrypted.unlink()
                         except: pass
 
